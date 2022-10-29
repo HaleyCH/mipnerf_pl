@@ -4,13 +4,13 @@ exp_name: 'lego'
 train:
   batch_size: 3072
   batch_type: 'all_images'  # single_image: inputs a full image; all_images: inputs batch_size rays sampled from different image
-  num_work: 4
+  num_work: 16
   randomized: True
   white_bkgd: True
 val:
   batch_size: 1
   batch_type: 'single_image'  # For "single_image", the batch must set to 1
-  num_work: 4
+  num_work: 1
   randomized: False
   white_bkgd: True
   check_interval: 10000
