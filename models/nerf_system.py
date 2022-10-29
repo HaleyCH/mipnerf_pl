@@ -1,6 +1,6 @@
 import torch
 from pytorch_lightning import LightningModule
-from models.mip_nerf import MipNerf
+from models.mip_nerf import FFMipNerf
 from models.mip import rearrange_render_image, distloss
 from utils.metrics import calc_psnr
 from datasets import dataset_dict
@@ -19,7 +19,7 @@ class MipNeRFSystem(LightningModule):
         self.white_bkgd = hparams['train.white_bkgd']
         self.val_chunk_size = hparams['val.chunk_size']
         self.batch_size = self.hparams['train.batch_size']
-        self.mip_nerf = MipNerf(
+        self.mip_nerf = FFMipNerf(
             num_samples=hparams['nerf.num_samples'],
             num_levels=hparams['nerf.num_levels'],
             resample_padding=hparams['nerf.resample_padding'],

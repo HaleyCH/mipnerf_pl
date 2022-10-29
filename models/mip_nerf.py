@@ -2,7 +2,7 @@ import torch
 from einops import repeat
 from models.mip import sample_along_rays, integrated_pos_enc, pos_enc, volumetric_rendering, resample_along_rays
 from collections import namedtuple
-
+import tinycudann as tcnn
 
 def _xavier_init(linear):
     """
@@ -110,6 +110,100 @@ class MLP(torch.nn.Module):
         raw_rgb = self.color_layer(x)
         return raw_rgb, raw_density
 
+
+config_hash = {
+    "loss": {
+        "otype": "RelativeL2"
+    },
+    "optimizer": {
+        "otype": "Adam",
+        "learning_rate": 1e-2,
+        "beta1": 0.9,
+        "beta2": 0.99,
+        "epsilon": 1e-15,
+        "l2_reg": 1e-6
+    },
+    "encoding": {
+        "otype": "HashGrid",
+        "n_levels": 16,
+        "n_features_per_level": 2,
+        "log2_hashmap_size": 15,
+        "base_resolution": 16,
+        "per_level_scale": 1.5
+    },
+    "network": {
+        "otype": "FullyFusedMLP",
+        "activation": "None",
+        "output_activation": "None",
+        "n_neurons": 64,
+        "n_hidden_layers": 2
+    }
+}
+
+
+class FFMLP(MLP):
+    def __init__(self, net_depth: int, net_width: int, net_depth_condition: int, net_width_condition: int,
+                 skip_index: int, num_rgb_channels: int, num_density_channels: int, activation: str,
+                 xyz_dim: int, view_dim: int):
+        """
+        net_depth: The depth of the first part of MLP.
+        net_width: The width of the first part of MLP.
+        net_depth_condition: The depth of the second part of MLP.
+        net_width_condition: The width of the second part of MLP.
+        activation: The activation function.
+        skip_index: Add a skip connection to the output of every N layers.
+        num_rgb_channels: The number of RGB channels.
+        num_density_channels: The number of density channels.
+        """
+    super(FFMLP, self).__init__(net_depth, net_width, net_depth_condition, net_width_condition,
+    skip_index, num_rgb_channels, num_density_channels, activation,
+    xyz_dim, view_dim)
+    self.skip_index = skip_index  # Add a skip connection to the output of every N layers.
+    layers = []
+    for i in range(net_depth):
+        if i == 0:
+            dim_in = xyz_dim
+            dim_out = net_width
+        elif (i - 1) % skip_index == 0 and i > 1:
+            dim_in = net_width + xyz_dim
+            dim_out = net_width
+        else:
+            dim_in = net_width
+            dim_out = net_width
+        # linear = torch.nn.Linear(dim_in, dim_out)
+        # _xavier_init(linear)
+        linear = tcnn.Network(dim_in,dim_out,config_hash["network"])
+        if activation == 'relu':
+            layers.append(torch.nn.Sequential(linear, torch.nn.ReLU(True)))
+        else:
+            raise NotImplementedError
+        self.layers = torch.nn.ModuleList(layers)
+    del layers
+    # self.density_layer = torch.nn.Linear(net_width, num_density_channels)
+    # _xavier_init(self.density_layer)
+    self.density_layer = tcnn.Network(net_width,num_density_channels,config_hash["network"])
+    # self.extra_layer = torch.nn.Linear(net_width, net_width)  # extra_layer is not the same as NeRF
+    # _xavier_init(self.extra_layer)
+    self.extra_layer = tcnn.Network(net_width,net_width,config_hash["network"])
+    layers = []
+    for i in range(net_depth_condition):
+        if i == 0:
+            dim_in = net_width + view_dim
+            dim_out = net_width_condition
+        else:
+            dim_in = net_width_condition
+            dim_out = net_width_condition
+        # linear = torch.nn.Linear(dim_in, dim_out)
+        # _xavier_init(linear)
+        linear = tcnn.Network(dim_in,dim_out,config_hash["network"])
+        if activation == 'relu':
+            layers.append(torch.nn.Sequential(linear, torch.nn.ReLU(True)))
+        else:
+            raise NotImplementedError
+        self.view_layers = torch.nn.Sequential(*layers)
+    del layers
+    # self.color_layer = torch.nn.Linear(net_width_condition, num_rgb_channels)
+    self.color_layer = tcnn.Network(net_width_condition,num_rgb_channels,config_hash["network"])
 
 class MipNerf(torch.nn.Module):
     """Nerf NN Model with both coarse and fine MLPs."""
@@ -246,3 +340,59 @@ class MipNerf(torch.nn.Module):
             ret.append((comp_rgb, distance, acc, weights, t_samples))
 
         return ret
+
+class FFMipNerf(MipNerf):
+    def __init__(self, num_samples: int = 128,
+                 num_levels: int = 2,
+                 resample_padding: float = 0.01,
+                 stop_resample_grad: bool = True,
+                 use_viewdirs: bool = True,
+                 disparity: bool = False,
+                 ray_shape: str = 'cone',
+                 min_deg_point: int = 0,
+                 max_deg_point: int = 16,
+                 deg_view: int = 4,
+                 density_activation: str = 'softplus',
+                 density_noise: float = 0.,
+                 density_bias: float = -1.,
+                 rgb_activation: str = 'sigmoid',
+                 rgb_padding: float = 0.001,
+                 disable_integration: bool = False,
+                 append_identity: bool = True,
+                 mlp_net_depth: int = 8,
+                 mlp_net_width: int = 256,
+                 mlp_net_depth_condition: int = 1,
+                 mlp_net_width_condition: int = 128,
+                 mlp_skip_index: int = 4,
+                 mlp_num_rgb_channels: int = 3,
+                 mlp_num_density_channels: int = 1,
+                 mlp_net_activation: str = 'relu'):
+        super(MipNerf, self).__init__()
+        self.num_levels = num_levels  # The number of sampling levels.
+        self.num_samples = num_samples  # The number of samples per level.
+        self.disparity = disparity  # If True, sample linearly in disparity, not in depth.
+        self.ray_shape = ray_shape  # The shape of cast rays ('cone' or 'cylinder').
+        self.disable_integration = disable_integration  # If True, use PE instead of IPE.
+        self.min_deg_point = min_deg_point  # Min degree of positional encoding for 3D points.
+        self.max_deg_point = max_deg_point  # Max degree of positional encoding for 3D points.
+        self.use_viewdirs = use_viewdirs  # If True, use view directions as a condition.
+        self.deg_view = deg_view  # Degree of positional encoding for viewdirs.
+        self.density_noise = density_noise  # Standard deviation of noise added to raw density.
+        self.density_bias = density_bias  # The shift added to raw densities pre-activation.
+        self.resample_padding = resample_padding  # Dirichlet/alpha "padding" on the histogram.
+        self.stop_resample_grad = stop_resample_grad  # If True, don't backprop across levels')
+        mlp_xyz_dim = (max_deg_point - min_deg_point) * 3 * 2
+        mlp_view_dim = deg_view * 3 * 2
+        mlp_view_dim = mlp_view_dim + 3 if append_identity else mlp_view_dim
+        self.mlp = FFMLP(mlp_net_depth, mlp_net_width, mlp_net_depth_condition, mlp_net_width_condition,
+                       mlp_skip_index, mlp_num_rgb_channels, mlp_num_density_channels, mlp_net_activation,
+                       mlp_xyz_dim, mlp_view_dim)
+        if rgb_activation == 'sigmoid':  # The RGB activation.
+            self.rgb_activation = torch.nn.Sigmoid()
+        else:
+            raise NotImplementedError
+        self.rgb_padding = rgb_padding
+        if density_activation == 'softplus':  # Density activation.
+            self.density_activation = torch.nn.Softplus()
+        else:
+            raise NotImplementedError
